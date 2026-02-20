@@ -1,0 +1,130 @@
+services:
+
+  chatwoot-init:
+    image: chatwoot-lyvio:custom
+    container_name: chatwoot-lyvio-init
+    env_file: .env
+    restart: "no"
+    command: >
+      sh -lc '
+        cat > /tmp/setup_brand.rb << "RUBY"
+        upsert = ->(k,v){
+          next if v.nil? || v.strip.empty?
+          c = InstallationConfig.find_or_initialize_by(name: k)
+          if c.respond_to?(:value=)
+            c.value = v
+          else
+            c.serialized_value = { value: v }
+          end
+          c.locked = false if c.respond_to?(:locked=)
+          c.save!
+        }
+        upsert.call("INSTALLATION_NAME",  ENV.fetch("CW_INSTALLATION_NAME",  "Lyvio"))
+        upsert.call("BRAND_NAME",         ENV.fetch("CW_BRAND_NAME",         "Lyvio"))
+        upsert.call("BRAND_URL",          ENV.fetch("CW_BRAND_URL",          "https://lyvio.io"))
+        upsert.call("WIDGET_BRAND_URL",   ENV.fetch("CW_WIDGET_BRAND_URL",   ENV.fetch("CW_BRAND_URL", "https://lyvio.io")))
+        GlobalConfig.clear_cache
+        Rails.cache.clear if defined?(Rails)
+        puts "✓ Brand config aplicada"
+        RUBY
+        bundle exec rails runner /tmp/setup_brand.rb
+      '
+    networks:
+      - web
+      - shared-services
+
+  chatwoot-lyvio:
+    build: .
+    image: chatwoot-lyvio:custom
+    container_name: chatwoot-lyvio
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      chatwoot-init:
+        condition: service_completed_successfully
+    command: >
+      sh -c "
+        bundle exec rake db:chatwoot_prepare &&
+        bundle exec rails s -p 3000 -b 0.0.0.0
+      "
+    networks:
+      - web
+      - shared-services
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=web"
+      # HTTP -> HTTPS
+      - "traefik.http.routers.chat.rule=Host(`app.lyvio.io`)"
+      - "traefik.http.routers.chat.entrypoints=web"
+      - "traefik.http.routers.chat.middlewares=chat-https-redirect"
+      - "traefik.http.middlewares.chat-https-redirect.redirectscheme.scheme=https"
+      - "traefik.http.middlewares.chat-https-redirect.redirectscheme.permanent=true"
+      # HTTPS
+      - "traefik.http.routers.chat-secure.rule=Host(`app.lyvio.io`)"
+      - "traefik.http.routers.chat-secure.entrypoints=websecure"
+      - "traefik.http.routers.chat-secure.tls.certresolver=letsencrypt"
+      - "traefik.http.services.chat-secure.loadbalancer.server.port=3000"
+
+  chatwoot-lyvio-worker:
+    image: chatwoot-lyvio:custom
+    container_name: chatwoot-lyvio-worker
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      chatwoot-init:
+        condition: service_completed_successfully
+    command: bundle exec sidekiq -C config/sidekiq.yml
+    networks:
+      - shared-services
+    healthcheck:
+      test: ["CMD", "sh", "-lc", "ps -ef | grep sidekiq | grep -v grep"]
+      interval: 30s
+      timeout: 5s
+      retries: 10
+
+  landing_lyvio:
+    image: nginxinc/nginx-unprivileged:1.27-alpine
+    container_name: landing_lyvio
+    restart: unless-stopped
+    networks:
+      - web
+    volumes:
+      # Sirve todo lo que tengas dentro de ./landing (index.html, /src, etc.)
+      - ./landing:/usr/share/nginx/html:ro
+
+    # Salud básica (opcional)
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/ | grep -qi '<html'"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=web"
+
+      # HTTP -> HTTPS
+      - "traefik.http.routers.landing-lyvio.rule=Host(`lyvio.io`,`www.lyvio.io`)"
+      - "traefik.http.routers.landing-lyvio.entrypoints=web"
+      - "traefik.http.routers.landing-lyvio.middlewares=landing-https-redirect"
+      - "traefik.http.middlewares.landing-https-redirect.redirectscheme.scheme=https"
+      - "traefik.http.middlewares.landing-https-redirect.redirectscheme.permanent=true"
+
+      # HTTPS
+      - "traefik.http.routers.landing-lyvio-secure.rule=Host(`lyvio.io`,`www.lyvio.io`)"
+      - "traefik.http.routers.landing-lyvio-secure.entrypoints=websecure"
+      - "traefik.http.routers.landing-lyvio-secure.tls.certresolver=letsencrypt"
+      # El contenedor escucha en 8080 (imagen unprivileged)
+      - "traefik.http.services.landing-lyvio-secure.loadbalancer.server.port=8080"
+
+      # (Opcional) Canonicaliza www -> apex
+      - "traefik.http.middlewares.www2apex.redirectregex.regex=^https?://www\\.lyvio\\.io/(.*)"
+      - "traefik.http.middlewares.www2apex.redirectregex.replacement=https://lyvio.io/$$1"
+      - "traefik.http.middlewares.www2apex.redirectregex.permanent=true"
+      - "traefik.http.routers.landing-lyvio-secure.middlewares=www2apex"
+      
+networks:
+  web:
+    external: true
+  shared-services:
+    external: true

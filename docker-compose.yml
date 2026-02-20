@@ -1,0 +1,134 @@
+services:
+  chatwoot-lyvio:
+    build: .
+    image: chatwoot-lyvio:custom
+    container_name: chatwoot-lyvio
+    restart: unless-stopped
+    env_file: .env
+    command: >
+      sh -c "
+        bundle exec rake db:chatwoot_prepare &&
+        bundle exec rails s -p 3000 -b 0.0.0.0
+      "
+    networks:
+      - web
+      - shared-services
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=web"
+      # HTTP -> HTTPS
+      - "traefik.http.routers.chat.rule=Host(`app.lyvio.io`)"
+      - "traefik.http.routers.chat.entrypoints=web"
+      - "traefik.http.routers.chat.middlewares=chat-https-redirect"
+      - "traefik.http.middlewares.chat-https-redirect.redirectscheme.scheme=https"
+      - "traefik.http.middlewares.chat-https-redirect.redirectscheme.permanent=true"
+      # HTTPS
+      - "traefik.http.routers.chat-secure.rule=Host(`app.lyvio.io`)"
+      - "traefik.http.routers.chat-secure.entrypoints=websecure"
+      - "traefik.http.routers.chat-secure.tls.certresolver=letsencrypt"
+      - "traefik.http.services.chat-secure.loadbalancer.server.port=3000"
+
+  chatwoot-lyvio-worker:
+    image: chatwoot-lyvio:custom
+    container_name: chatwoot-lyvio-worker
+    restart: unless-stopped
+    env_file: .env
+    command: bundle exec sidekiq -C config/sidekiq.yml
+    networks:
+      - shared-services
+    healthcheck:
+      test: ["CMD", "sh", "-lc", "ps -ef | grep sidekiq | grep -v grep"]
+      interval: 30s
+      timeout: 5s
+      retries: 10
+
+  lyvio-migrations:
+    build:
+      context: ./lyvio-platform
+      dockerfile: Dockerfile
+    image: lyvio-platform:latest
+    container_name: lyvio-migrations
+    user: "0:0"  # ← AGREGAR ESTA LÍNEA (ejecuta como root)
+    command: >
+      sh -c "
+        python manage.py makemigrations --noinput &&
+        python manage.py migrate --noinput &&
+        python manage.py collectstatic --noinput &&
+        chown -R 1000:1000 /app/staticfiles /app/media 2>/dev/null || true
+      "
+    volumes:
+      - ./lyvio-platform:/app
+      - ./lyvio-platform/staticfiles:/app/staticfiles
+      - ./lyvio-platform/media:/app/media
+    env_file:
+      - ./lyvio-platform/.env
+    environment:
+      - DJANGO_SETTINGS_MODULE=lyvio.settings
+      - PYTHONUNBUFFERED=1
+      - TZ=America/Bogota
+    networks:
+      - shared-services
+    restart: "no"
+
+  lyvio-platform:
+    build:
+      context: ./lyvio-platform
+      dockerfile: Dockerfile
+    image: lyvio-platform:latest
+    container_name: lyvio-platform
+    restart: unless-stopped
+    user: "0:0"
+    command: gunicorn lyvio.wsgi:application --bind 0.0.0.0:8000 --workers 3 --threads 2 --worker-class gthread --worker-tmp-dir /dev/shm --timeout 120 --access-logfile - --error-logfile - --log-level info
+    volumes:
+      - ./lyvio-platform/staticfiles:/app/staticfiles
+      - ./lyvio-platform/media:/app/media
+      - ./lyvio-platform/logs:/app/logs
+    expose:
+      - "8000"
+    env_file:
+      - ./lyvio-platform/.env
+    environment:
+      - DJANGO_SETTINGS_MODULE=lyvio.settings
+      - PYTHONUNBUFFERED=1
+      - TZ=America/Bogota
+    networks:
+      - web
+      - shared-services
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=web"
+      
+      # === HTTPS Router para lyvio.io ===
+      - "traefik.http.routers.lyvio-platform-secure.rule=Host(`lyvio.io`)"
+      - "traefik.http.routers.lyvio-platform-secure.entrypoints=websecure"
+      - "traefik.http.routers.lyvio-platform-secure.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.lyvio-platform-secure.service=lyvio-platform"
+      - "traefik.http.services.lyvio-platform.loadbalancer.server.port=8000"
+      
+      # === HTTP Router (redirect to HTTPS) ===
+      - "traefik.http.routers.lyvio-platform.rule=Host(`lyvio.io`)"
+      - "traefik.http.routers.lyvio-platform.entrypoints=web"
+      - "traefik.http.routers.lyvio-platform.middlewares=lyvio-platform-redirect"
+      - "traefik.http.middlewares.lyvio-platform-redirect.redirectscheme.scheme=https"
+      - "traefik.http.middlewares.lyvio-platform-redirect.redirectscheme.permanent=true"
+
+      # === Headers de seguridad ===
+      - "traefik.http.middlewares.lyvio-platform-headers.headers.customrequestheaders.X-Forwarded-Proto=https"
+      - "traefik.http.routers.lyvio-platform-secure.middlewares=lyvio-platform-headers"
+
+networks:
+  web:
+    external: true
+  shared-services:
+    external: true

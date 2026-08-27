@@ -38,6 +38,19 @@ COPY brand/favicon-96x96.png  /app/public/favicon-96x96.png
 COPY brand/logo.svg               /app/app/javascript/widget/assets/images/logo.svg
 
 # ========================================
+# LYVIO BRANDING: Parchear installation_config.yml (fuente del seed)
+# Esto evita que db:chatwoot_prepare re-seedee con "Chatwoot"
+# ========================================
+RUN sed -i \
+    -e 's/value: Chatwoot$/value: Lyvio/g' \
+    -e "s/value: 'Chatwoot'$/value: 'Lyvio'/g" \
+    /app/config/installation_config.yml && \
+    echo "=== LYVIO: Verificando installation_config.yml ===" && \
+    grep -A1 "name: INSTALLATION_NAME" /app/config/installation_config.yml && \
+    grep -A1 "name: BRAND_NAME" /app/config/installation_config.yml && \
+    echo "=== installation_config.yml parcheado ==="
+
+# ========================================
 # LYVIO CUSTOMIZATION: Ocultar tab "Todos" para agentes
 # ========================================
 
@@ -47,7 +60,8 @@ COPY custom_files/patches/permissions.js \
 
 # Copiar y ejecutar patch del controller
 COPY custom_files/patches/controller_patch.sh /tmp/controller_patch.sh
-RUN chmod +x /tmp/controller_patch.sh && \
+RUN sed -i 's/\r$//' /tmp/controller_patch.sh && \
+    chmod +x /tmp/controller_patch.sh && \
     /tmp/controller_patch.sh && \
     rm /tmp/controller_patch.sh
 
@@ -58,55 +72,84 @@ RUN echo "=== LYVIO: Verificando modificaciones ===" && \
     echo "=== Modificaciones aplicadas correctamente ==="
 
 # ========================================
-# LYVIO SSO: Script de autenticación con Platform
+# LYVIO BILLING: banner de período de gracia (pago fallido)
+# Reutiliza el PaymentPendingBanner nativo de Chatwoot (atado a
+# isOnChatwootCloud, inactivo en self-hosted) leyendo en cambio los
+# custom_attributes que lyvio-platform escribe vía Platform API.
 # ========================================
 
-# Crear directorio para scripts personalizados
+COPY custom_files/patches/Banner.vue \
+     /app/app/javascript/dashboard/components/ui/Banner.vue
+COPY custom_files/patches/PaymentPendingBanner.vue \
+     /app/app/javascript/dashboard/components/app/PaymentPendingBanner.vue
+
+RUN echo "=== LYVIO BILLING: Verificando banner de período de gracia ===" && \
+    grep -c "lyvio_billing_status" /app/app/javascript/dashboard/components/app/PaymentPendingBanner.vue && \
+    grep -c "actionButtonLoading" /app/app/javascript/dashboard/components/ui/Banner.vue && \
+    echo "=== OK ==="
+
+# ========================================
+# LYVIO SSO: Botón "Administración" en el menú de perfil
+# NOTA: Chatwoot rediseñó el sidebar (components-next), la vieja inyección
+# por DOM (sso-button.js buscando "ul.sidebar-group-children") dejó de
+# funcionar porque esas clases ya no existen. Ahora se parchea el
+# componente Vue oficial del menú de perfil directamente en build-time.
+# ========================================
+
+COPY custom_files/patches/SidebarProfileMenu.vue \
+     /app/app/javascript/dashboard/components-next/sidebar/SidebarProfileMenu.vue
+
+RUN echo "=== LYVIO SSO: Verificando patch de SidebarProfileMenu.vue ===" && \
+    grep -A2 "initiateLyvioSSO" /app/app/javascript/dashboard/components-next/sidebar/SidebarProfileMenu.vue && \
+    echo "=== SidebarProfileMenu.vue parcheado correctamente ==="
+
 RUN mkdir -p /app/public/custom-scripts
 
-# Copiar el script SSO
-COPY custom_files/sso/sso-button.js /app/public/custom-scripts/sso-button.js
-
-# Copiar el initializer de Rails para inyectar el script
-COPY custom_files/sso/lyvio_sso_inject.rb /app/config/initializers/lyvio_sso_inject.rb
-
-# Verificar que el script se copió
-RUN echo "=== LYVIO SSO: Verificando instalación ===" && \
-    ls -la /app/public/custom-scripts/ && \
-    cat /app/config/initializers/lyvio_sso_inject.rb && \
-    echo "=== Script SSO instalado correctamente ==="
-
 # ========================================
-# LYVIO SUSPENDED PAGE: Script de redirección a pago
+# LYVIO SUSPENDED PAGE
 # ========================================
 
-# Copiar el script para página suspendida
 COPY custom_files/sso/suspended-page.js /app/public/custom-scripts/suspended-page.js
-
-# Copiar el initializer de Rails para inyectar el script
 COPY custom_files/sso/lyvio_suspended_inject.rb /app/config/initializers/lyvio_suspended_inject.rb
 
-# Verificar que el script se copió
 RUN echo "=== LYVIO SUSPENDED: Verificando instalación ===" && \
     ls -la /app/public/custom-scripts/ && \
-    cat /app/config/initializers/lyvio_suspended_inject.rb && \
     echo "=== Script Suspended Page instalado correctamente ==="
 
 # ========================================
-# LYVIO BOTS PAGE: Botón entrenar bot
+# LYVIO BOTS PAGE
 # ========================================
 
-# Copiar el script para página de bots
 COPY custom_files/sso/bots-page.js /app/public/custom-scripts/bots-page.js
-
-# Copiar el initializer de Rails para inyectar el script
 COPY custom_files/sso/lyvio_bots_inject.rb /app/config/initializers/lyvio_bots_inject.rb
 
-# Verificar que el script se copió
 RUN echo "=== LYVIO BOTS: Verificando instalación ===" && \
     ls -la /app/public/custom-scripts/ && \
-    cat /app/config/initializers/lyvio_bots_inject.rb && \
     echo "=== Script Bots Page instalado correctamente ==="
+
+# ========================================
+# LYVIO BRANDING: initializer (boot) + job programado (cada 5 min)
+# Sobreescribe INSTALLATION_NAME/BRAND_NAME por si acaso el seed corre con
+# imagen vieja, y se re-verifica periódicamente por si se revierte en caliente.
+# ========================================
+
+COPY custom_files/branding/lyvio_branding.rb /app/config/initializers/lyvio_branding.rb
+COPY custom_files/branding/lyvio_enforce_branding_job.rb /app/app/jobs/lyvio_enforce_branding_job.rb
+
+RUN cat >> /app/config/schedule.yml << 'EOF'
+
+# executed every 5 minutes as a safety net in case INSTALLATION_NAME/BRAND_NAME
+# ever drifts back to the Chatwoot defaults while the process keeps running
+lyvio_enforce_branding_job:
+  cron: '*/5 * * * *'
+  class: 'LyvioEnforceBrandingJob'
+  queue: scheduled_jobs
+EOF
+
+RUN echo "=== LYVIO BRANDING: Verificando job + schedule ===" && \
+    grep -A3 "lyvio_enforce_branding_job" /app/config/schedule.yml && \
+    grep -c "class LyvioEnforceBrandingJob" /app/app/jobs/lyvio_enforce_branding_job.rb && \
+    echo "=== OK ==="
 
 # ========================================
 # FIN LYVIO CUSTOMIZATION
@@ -137,17 +180,21 @@ COPY --from=build /app/app/javascript/dashboard/constants/permissions.js \
 COPY --from=build /app/app/controllers/api/v1/accounts/conversations_controller.rb \
                   /app/app/controllers/api/v1/accounts/conversations_controller.rb
 
-# Copiar configuración SSO
-COPY --from=build /app/config/initializers/lyvio_sso_inject.rb \
-                  /app/config/initializers/lyvio_sso_inject.rb
+# Copiar installation_config.yml parcheado (evita re-seed con "Chatwoot")
+COPY --from=build /app/config/installation_config.yml \
+                  /app/config/installation_config.yml
 
-# Copiar configuración Suspended Page
+# Copiar initializers
 COPY --from=build /app/config/initializers/lyvio_suspended_inject.rb \
                   /app/config/initializers/lyvio_suspended_inject.rb
-
-# Copiar configuración Bots Page
 COPY --from=build /app/config/initializers/lyvio_bots_inject.rb \
                   /app/config/initializers/lyvio_bots_inject.rb
+COPY --from=build /app/config/initializers/lyvio_branding.rb \
+                  /app/config/initializers/lyvio_branding.rb
+COPY --from=build /app/app/jobs/lyvio_enforce_branding_job.rb \
+                  /app/app/jobs/lyvio_enforce_branding_job.rb
+COPY --from=build /app/config/schedule.yml \
+                  /app/config/schedule.yml
 
 # Estáticos que sirve la app
 COPY --from=build /app/public/assets        /app/public/assets
